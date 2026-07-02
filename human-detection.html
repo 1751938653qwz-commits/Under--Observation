@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>人物检测 - 视频故障特效</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #000; overflow: hidden; width: 100vw; height: 100vh; }
+
+        #videoContainer {
+            position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; overflow: hidden; background: #000;
+        }
+        #bgVideo {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            min-width: 100%; min-height: 100%; width: auto; height: auto; object-fit: cover; display: block;
+        }
+        #canvas {
+            position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 10; pointer-events: none;
+        }
+        #webcam {
+            position: fixed; top: -9999px; left: -9999px; width: 320px; height: 240px;
+            opacity: 0; pointer-events: none;
+        }
+
+        #loading {
+            position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 100;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            background: #0a0a0a; color: #fff; font-size: 18px; transition: opacity 0.8s ease;
+        }
+        #loading.hidden { opacity: 0; pointer-events: none; }
+        #loading .spinner {
+            width: 48px; height: 48px; border: 3px solid rgba(255,255,255,0.1); border-top-color: #fff;
+            border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 20px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        #loading p { opacity: 0.7; font-weight: 300; }
+        #loading .sub { font-size: 13px; opacity: 0.4; margin-top: 8px; }
+    </style>
+</head>
+<body>
+
+    <div id="loading">
+        <div class="spinner"></div>
+        <p>正在加载模型...</p>
+        <div class="sub">首次加载可能需要一些时间</div>
+    </div>
+
+    <div id="videoContainer">
+        <video id="bgVideo" loop playsinline preload="auto"></video>
+    </div>
+
+    <canvas id="canvas"></canvas>
+    <video id="webcam" playsinline></video>
+
+    <script type="module">
+        const bgVideo = document.getElementById('bgVideo');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const webcam = document.getElementById('webcam');
+        const loading = document.getElementById('loading');
+
+        let isHumanDetected = false;
+        let animationId = null;
+        let videoReady = false;
+        let frameCount = 0;
+        let glitchActive = false;
+        let glitchTimer = 0;
+        const GLITCH_INTERVAL = 8; // 每 8 帧更新一次特效
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        function loadVideo() {
+            return new Promise((resolve) => {
+                bgVideo.src = 'video.mp4';
+                bgVideo.load();
+
+                let resolved = false;
+                function done() {
+                    if (resolved) return;
+                    resolved = true;
+                    videoReady = true;
+                    resolve();
+                }
+
+                bgVideo.addEventListener('canplay', done, { once: true });
+                bgVideo.addEventListener('loadeddata', done, { once: true });
+                if (bgVideo.readyState >= 2) done();
+                bgVideo.addEventListener('error', () => {}, { once: true });
+
+                setTimeout(() => {
+                    if (!resolved) {
+                        videoReady = true;
+                        resolved = true;
+                        resolve();
+                    }
+                }, 5000);
+            });
+        }
+
+        async function playVideo() {
+            for (let i = 0; i < 3; i++) {
+                try {
+                    await bgVideo.play();
+                    return true;
+                } catch (e) {
+                    await new Promise(r => setTimeout(r, 200));
+                }
+            }
+            return false;
+        }
+
+        async function initHuman() {
+            const module = await import('https://cdn.jsdelivr.net/npm/@vladmandic/human@latest/dist/human.esm.js');
+            const Human = module.default || module.Human;
+
+            const human = new Human({
+                backend: 'webgl',
+                async: true,
+                warmup: 'none',
+                modelBasePath: 'https://cdn.jsdelivr.net/npm/@vladmandic/human@latest/models/',
+                filter: { enabled: false },
+                face: { enabled: true, detector: { enabled: true, maxDetected: 5, minScore: 0.3 }, mesh: false, iris: false, description: false, emotion: false },
+                body: { enabled: true, maxDetected: 5, minScore: 0.1 },
+                hand: { enabled: false },
+                object: { enabled: false },
+                gesture: { enabled: false },
+            });
+
+            await human.load();
+
+            const wc = document.createElement('canvas');
+            wc.width = 64; wc.height = 48;
+            const wctx = wc.getContext('2d');
+            wctx.fillStyle = '#808080';
+            wctx.fillRect(0, 0, 64, 48);
+            await human.detect(wc);
+
+            return human;
+        }
+
+        async function initCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+                    audio: false,
+                });
+                webcam.srcObject = stream;
+                await webcam.play();
+                return true;
+            } catch (err) {
+                return false;
+            }
+        }
+
+        async function detectHuman(human) {
+            if (!human || webcam.readyState < 2) return false;
+            try {
+                const result = await human.detect(webcam);
+
+                let hasFace = false;
+                if (result.face && Array.isArray(result.face) && result.face.length > 0) {
+                    for (const f of result.face) {
+                        if (f.score && f.score > 0.5) { hasFace = true; break; }
+                    }
+                }
+
+                let hasBody = false;
+                if (result.body && Array.isArray(result.body) && result.body.length > 0) {
+                    for (const b of result.body) {
+                        if (b.score && b.score > 0.3) { hasBody = true; break; }
+                    }
+                }
+
+                return hasFace || hasBody;
+            } catch (err) {
+                return false;
+            }
+        }
+
+        function applyGlitchEffect() {
+            const w = canvas.width;
+            const h = canvas.height;
+
+            ctx.clearRect(0, 0, w, h);
+            ctx.drawImage(bgVideo, 0, 0, w, h);
+
+            // 随机选择故障区域（加大区域以容纳超大块）
+            const areaX = Math.floor(Math.random() * (w * 0.5)) + w * 0.1;
+            const areaY = Math.floor(Math.random() * (h * 0.5)) + h * 0.1;
+            const areaW = 300 + Math.floor(Math.random() * 400);  // 300~700px
+            const areaH = 250 + Math.floor(Math.random() * 350);  // 250~600px
+
+            // 1. RGB 通道偏移
+            const offsetX = 15 + Math.floor(Math.random() * 30);
+
+            ctx.globalCompositeOperation = 'screen';
+            ctx.globalAlpha = 0.2;
+
+            ctx.drawImage(
+                bgVideo,
+                areaX, areaY, areaW, areaH,
+                areaX + offsetX, areaY, areaW, areaH
+            );
+
+            ctx.globalAlpha = 1.0;
+            ctx.globalCompositeOperation = 'source-over';
+
+            // 2. 超大块矩形错位（0~1 个，50%概率出现）
+            if (Math.random() < 0.5) {
+                const bw = 320 + Math.floor(Math.random() * 640); // 320~960px
+                const bh = 240 + Math.floor(Math.random() * 480); // 240~720px
+                const bx = areaX + Math.floor(Math.random() * Math.max(1, areaW - bw));
+                const by = areaY + Math.floor(Math.random() * Math.max(1, areaH - bh));
+                const boX = 40 + Math.floor(Math.random() * 80);
+
+                ctx.drawImage(bgVideo, bx, by, bw, bh, bx + boX, by, bw, bh);
+
+                if (Math.random() < 0.3) {
+                    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+                    ctx.fillRect(bx, by, bw, bh);
+                }
+
+                if (Math.random() < 0.35) {
+                    ctx.fillStyle = 'rgba(' +
+                        Math.floor(Math.random() * 120) + ',' +
+                        Math.floor(Math.random() * 80) + ',' +
+                        Math.floor(Math.random() * 150) + ',' +
+                        '0.25)';
+                    ctx.fillRect(bx + boX, by, bw, bh);
+                }
+            }
+
+            // 3. 撕裂条（1~2 条）
+            const tearCount = 1 + Math.floor(Math.random() * 2);
+            for (let t = 0; t < tearCount; t++) {
+                const tearY = areaY + Math.floor(Math.random() * areaH);
+                const tearH = 6 + Math.floor(Math.random() * 16);
+                const tearOffset = 20 + Math.floor(Math.random() * 40);
+
+                ctx.drawImage(
+                    bgVideo,
+                    areaX, tearY, areaW, tearH,
+                    areaX + tearOffset, tearY, areaW, tearH
+                );
+
+                if (Math.random() < 0.3) {
+                    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+                    ctx.fillRect(areaX, tearY, areaW, tearH);
+                }
+            }
+
+            // 4. 轻微闪烁
+            const fr = Math.random();
+            if (fr < 0.03) {
+                ctx.fillStyle = 'rgba(255,255,255,0.25)';
+                ctx.fillRect(areaX, areaY, areaW, areaH);
+            } else if (fr < 0.06) {
+                ctx.fillStyle = 'rgba(0,0,0,0.35)';
+                ctx.fillRect(areaX, areaY, areaW, areaH);
+            }
+        }
+
+        async function renderFrame(human) {
+            frameCount++;
+
+            if (frameCount % 3 === 0) {
+                isHumanDetected = await detectHuman(human);
+            }
+
+            if (isHumanDetected && videoReady) {
+                glitchTimer++;
+                if (glitchTimer >= GLITCH_INTERVAL) {
+                    glitchTimer = 0;
+                    applyGlitchEffect();
+                } else {
+                    // 保持上一帧的特效画面，不清空
+                }
+            } else {
+                glitchTimer = 0;
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+            }
+
+            animationId = requestAnimationFrame(() => renderFrame(human));
+        }
+
+        async function init() {
+            try {
+                await loadVideo();
+                const played = await playVideo();
+                const human = await initHuman();
+                await initCamera();
+
+                loading.classList.add('hidden');
+
+                if (!played) {
+                    document.addEventListener('click', async () => {
+                        try { await bgVideo.play(); } catch(e) {}
+                    }, { once: true });
+                }
+
+                renderFrame(human);
+
+            } catch (err) {
+                loading.classList.add('hidden');
+            }
+        }
+
+        if (document.readyState === 'complete') init();
+        else window.addEventListener('load', init);
+
+        window.addEventListener('beforeunload', () => {
+            if (animationId) cancelAnimationFrame(animationId);
+            if (webcam.srcObject) webcam.srcObject.getTracks().forEach(t => t.stop());
+        });
+    </script>
+
+</body>
+</html>
